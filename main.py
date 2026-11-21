@@ -24,7 +24,9 @@ it is loaded with the small stdlib PNG decoder below (IHDR/IDAT,
 zlib, all five scanline filters, 8-bit RGB/RGBA, non-interlaced) --
 no PIL at run time. The asset itself was prepared at build time
 only: a tight passport-style head-and-shoulders crop, resized to
-150x200. The face is untouched.
+150x200. The face is untouched; at run time the pink wall / dark
+door behind the holder is replaced with a plain light background
+(see clean_photo_background), as a real passport photo requires.
 
 Travel history (every stamp after the 14 MAR 2024 issue date):
   03 JUN 2024  out of Velmora, into Zoraville, Tarnovia (casino town)
@@ -390,6 +392,110 @@ def blit_photo(cv, img, x0, y0, w, h, alpha=1.0):
                 cv.blend(x0 + x, y0 + y, c, alpha)
 
 
+PHOTO_BG = (243, 242, 238)  # plain light passport-photo background
+
+
+def _rgb_dist(a, b):
+    dr = a[0] - b[0]
+    dg = a[1] - b[1]
+    db = a[2] - b[2]
+    return (dr * dr + dg * dg + db * db) ** 0.5
+
+
+def clean_photo_background(img):
+    """Replace the selfie's pink wall / dark door background with a plain
+    light passport-photo background, leaving the face untouched.
+
+    Region-grows outward from border pixels that match the two known
+    background colours (bright pink wall on the left, dark warm wood on
+    the right), stepping only to neighbours of similar colour, and never
+    into skin-like or very dark (hair) pixels. The shoulders fill the
+    bottom edge, so it is never used as a seed. The resulting mask is
+    box-blurred twice so the head/shoulders feather cleanly into the
+    flat light background instead of a hard cut-out edge. Pure stdlib,
+    fully deterministic."""
+    iw, ih, px = img
+
+    def pix(x, y):
+        o = (y * iw + x) * 3
+        return (px[o], px[o + 1], px[o + 2])
+
+    def is_seed(c):
+        r, g, b = c
+        if r >= 200 and b >= 170 and r - g >= 40:  # pink wall
+            return True
+        if (45 <= r <= 110 and 35 <= g <= 85 and 35 <= b <= 85
+                and r >= g and r - g <= 35):       # dark wood
+            return True
+        return False
+
+    def is_skin(c):
+        r, g, b = c
+        return (r > 150 and g > b and 30 <= r - g <= 70
+                and 40 <= r - b <= 95)
+
+    def is_hair_dark(c):
+        return (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) < 38
+
+    mask = bytearray(iw * ih)
+    stack = []
+    for x in range(iw):
+        if is_seed(pix(x, 0)):
+            stack.append((x, 0))
+    for y in range(ih):
+        if is_seed(pix(0, y)):
+            stack.append((0, y))
+        if is_seed(pix(iw - 1, y)):
+            stack.append((iw - 1, y))
+    # interior seeds: pink-wall pixels enclosed by hair strands, which
+    # the border flood can never reach. Strict test (B well above G)
+    # so bright skin highlights, which are pink-ish but B < G, never
+    # seed.
+    for y in range(ih):
+        for x in range(iw):
+            r, g, b = pix(x, y)
+            if r >= 200 and b - g >= 30 and r - g >= 40:
+                stack.append((x, y))
+    while stack:
+        x, y = stack.pop()
+        if mask[y * iw + x]:
+            continue
+        mask[y * iw + x] = 1
+        c = pix(x, y)
+        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if 0 <= nx < iw and 0 <= ny < ih and not mask[ny * iw + nx]:
+                n = pix(nx, ny)
+                if (_rgb_dist(c, n) <= 22 and not is_skin(n)
+                        and not is_hair_dark(n)):
+                    stack.append((nx, ny))
+    # feather: one 3x3 box blur of the mask -> soft alpha, then boost it
+    # so the background reads as flat light (a half-blended pink pixel
+    # still looks pink) while the subject edge keeps a ~1px soft rim.
+    alpha = [float(m) for m in mask]
+    nxt = [0.0] * (iw * ih)
+    for y in range(ih):
+        for x in range(iw):
+            s = 0.0
+            n = 0
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    xx, yy = x + dx, y + dy
+                    if 0 <= xx < iw and 0 <= yy < ih:
+                        s += alpha[yy * iw + xx]
+                        n += 1
+            nxt[y * iw + x] = min(1.0, (s / n) * 1.6)
+    alpha = nxt
+    out = bytearray(px)
+    for i in range(iw * ih):
+        a = alpha[i]
+        if a > 0:
+            o = i * 3
+            for k in range(3):
+                out[o + k] = int(round(PHOTO_BG[k] * a
+                                      + px[o + k] * (1 - a)))
+    return iw, ih, out
+
+
 # -------------------------------------------------------------- mrz --------
 def mrz_value(ch):
     if ch == '<':
@@ -743,6 +849,7 @@ def draw():
     cv.vline((LX1 + RX0) // 2, PY0, PY1 - 1, (150, 142, 120), 2)
     here = os.path.dirname(os.path.abspath(__file__))
     photo = load_png_rgb(os.path.join(here, "assets", "holder-photo.png"))
+    photo = clean_photo_background(photo)
     mrz = draw_left_page(cv, photo)
     draw_right_page(cv)
     return cv, mrz
